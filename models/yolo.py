@@ -520,11 +520,13 @@ class Panoptic(Detect):
 
 class BaseModel(nn.Module):
     # YOLO base model
-    def forward(self, x, profile=False, visualize=False):
-        return self._forward_once(x, profile, visualize)  # single-scale inference, train
+    def forward(self, x, profile=False, visualize=False, return_feat=False):
+        return self._forward_once(x, profile, visualize, return_feat)  # single-scale inference, train
 
-    def _forward_once(self, x, profile=False, visualize=False):
+    def _forward_once(self, x, profile=False, visualize=False, return_feat=False):
         y, dt = [], []  # outputs
+        neck_features = {} if return_feat else None
+        
         for m in self.model:
             if m.f != -1:  # if not from previous layer
                 x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
@@ -532,8 +534,17 @@ class BaseModel(nn.Module):
                 self._profile_one_layer(m, x, dt)
             x = m(x)  # run
             y.append(x if m.i in self.save else None)  # save output
+            
+            # 收集特征（如果需要）
+            if return_feat and hasattr(self, 'neck_indices'):
+                if m.i in self.neck_indices:
+                    neck_features[self.neck_indices[m.i]] = x
+            
             if visualize:
                 feature_visualization(x, m.type, m.i, save_dir=visualize)
+        
+        if return_feat:
+            return x, neck_features
         return x
 
     def _profile_one_layer(self, m, x, dt):
@@ -608,71 +619,117 @@ class DetectionModel(BaseModel):
             m.inplace = self.inplace
             forward = lambda x: self.forward(x)[0] if isinstance(m, (Segment, DSegment, Panoptic)) else self.forward(x)
             m.stride = torch.tensor([s / x.shape[-2] for x in forward(torch.zeros(1, ch, s, s))])  # forward
-            # check_anchor_order(m)
-            # m.anchors /= m.stride.view(-1, 1, 1)
             self.stride = m.stride
             m.bias_init()  # only run once
+            
+            # 新增：找到 P3/P4/P5 层的索引
+            self._find_neck_indices()
+            
         if isinstance(m, (DualDetect, TripleDetect, DualDDetect, TripleDDetect, DualDSegment)):
             s = 256  # 2x min stride
             m.inplace = self.inplace
             forward = lambda x: self.forward(x)[0][0] if isinstance(m, (DualDSegment)) else self.forward(x)[0]
             m.stride = torch.tensor([s / x.shape[-2] for x in forward(torch.zeros(1, ch, s, s))])  # forward
-            # check_anchor_order(m)
-            # m.anchors /= m.stride.view(-1, 1, 1)
             self.stride = m.stride
             m.bias_init()  # only run once
+            
+            # 新增：找到 P3/P4/P5 层的索引
+            self._find_neck_indices()
 
         # Init weights, biases
         initialize_weights(self)
         self.info()
         LOGGER.info('')
+    
+    def _find_neck_indices(self):
+        """动态查找 P3/P4/P5 特征层的索引"""
+        self.neck_indices = {}
+        
+        # 获取检测头
+        detect_module = self.model[-1]
+        
+        # 检查检测头的输入来源
+        if hasattr(detect_module, 'f'):
+            # f 属性包含了输入到检测头的层索引
+            input_indices = detect_module.f if isinstance(detect_module.f, list) else [detect_module.f]
+            
+            # 根据输入的数量和顺序，通常 P3, P4, P5 对应前三个输入
+            if len(input_indices) >= 3:
+                # 对于标准的 YOLO 架构，通常是 [P3_idx, P4_idx, P5_idx]
+                # 但我们需要验证这些层的 stride
+                test_input = torch.zeros(1, 3, 640, 640)
+                outputs = []
+                
+                with torch.no_grad():
+                    x = test_input
+                    y = []
+                    for i, m in enumerate(self.model[:-1]):  # 排除最后的检测头
+                        if m.f != -1:
+                            x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]
+                        x = m(x)
+                        y.append(x if m.i in self.save else None)
+                        
+                        if i in input_indices:
+                            outputs.append((i, x.shape[-1] if isinstance(x, torch.Tensor) else None))
+                
+                # 根据特征图大小判断 P3/P4/P5
+                # 假设输入是 640x640，则 P3=80, P4=40, P5=20
+                for idx, size in outputs:
+                    if size is not None:
+                        stride = 640 // size
+                        if stride == 8:
+                            self.neck_indices[idx] = 'P3'
+                        elif stride == 16:
+                            self.neck_indices[idx] = 'P4'
+                        elif stride == 32:
+                            self.neck_indices[idx] = 'P5'
+                
+                LOGGER.info(f"Found neck feature indices: {self.neck_indices}")
+        
+        # 如果没有找到，尝试基于模型结构的启发式方法
+        if not self.neck_indices:
+            LOGGER.warning("Could not automatically find P3/P4/P5 indices, using fallback method")
+            # 这里可以添加备用的启发式方法
+            # 例如查找特定类型的层或基于层的输出通道数等
 
-    def forward(self, x, augment=False, profile=False, visualize=False):
+    def forward(self, x, augment=False, profile=False, visualize=False, return_feat=False):
         if augment:
             return self._forward_augment(x)  # augmented inference, None
-        return self._forward_once(x, profile, visualize)  # single-scale inference, train
+        return self._forward_once(x, profile, visualize, return_feat)  # 传递 return_feat
 
-    def _forward_augment(self, x):
-        img_size = x.shape[-2:]  # height, width
-        s = [1, 0.83, 0.67]  # scales
-        f = [None, 3, None]  # flips (2-ud, 3-lr)
-        y = []  # outputs
-        for si, fi in zip(s, f):
-            xi = scale_img(x.flip(fi) if fi else x, si, gs=int(self.stride.max()))
-            yi = self._forward_once(xi)[0]  # forward
-            # cv2.imwrite(f'img_{si}.jpg', 255 * xi[0].cpu().numpy().transpose((1, 2, 0))[:, :, ::-1])  # save
-            yi = self._descale_pred(yi, fi, si, img_size)
-            y.append(yi)
-        y = self._clip_augmented(y)  # clip augmented tails
-        return torch.cat(y, 1), None  # augmented inference, train
-
-    def _descale_pred(self, p, flips, scale, img_size):
-        # de-scale predictions following augmented inference (inverse operation)
-        if self.inplace:
-            p[..., :4] /= scale  # de-scale
-            if flips == 2:
-                p[..., 1] = img_size[0] - p[..., 1]  # de-flip ud
-            elif flips == 3:
-                p[..., 0] = img_size[1] - p[..., 0]  # de-flip lr
-        else:
-            x, y, wh = p[..., 0:1] / scale, p[..., 1:2] / scale, p[..., 2:4] / scale  # de-scale
-            if flips == 2:
-                y = img_size[0] - y  # de-flip ud
-            elif flips == 3:
-                x = img_size[1] - x  # de-flip lr
-            p = torch.cat((x, y, wh, p[..., 4:]), -1)
-        return p
-
-    def _clip_augmented(self, y):
-        # Clip YOLO augmented inference tails
-        nl = self.model[-1].nl  # number of detection layers (P3-P5)
-        g = sum(4 ** x for x in range(nl))  # grid points
-        e = 1  # exclude layer count
-        i = (y[0].shape[1] // g) * sum(4 ** x for x in range(e))  # indices
-        y[0] = y[0][:, :-i]  # large
-        i = (y[-1].shape[1] // g) * sum(4 ** (nl - 1 - x) for x in range(e))  # indices
-        y[-1] = y[-1][:, i:]  # small
-        return y
+    def set_neck_indices(self, p3_idx=None, p4_idx=None, p5_idx=None):
+        """手动设置 P3/P4/P5 层的索引（用于自动检测失败的情况）"""
+        self.neck_indices = {}
+        if p3_idx is not None:
+            self.neck_indices[p3_idx] = 'P3'
+        if p4_idx is not None:
+            self.neck_indices[p4_idx] = 'P4'
+        if p5_idx is not None:
+            self.neck_indices[p5_idx] = 'P5'
+        LOGGER.info(f"Manually set neck feature indices: {self.neck_indices}")
+    
+    def print_model_structure(self):
+        """打印模型结构，帮助调试和找到正确的层索引"""
+        x = torch.zeros(1, 3, 640, 640)
+        y = []
+        print("\n" + "="*80)
+        print("Model Structure Analysis:")
+        print("="*80)
+        print(f"{'Index':<6} {'From':<6} {'Module':<40} {'Output Shape':<20}")
+        print("-"*80)
+        
+        with torch.no_grad():
+            for i, m in enumerate(self.model):
+                if m.f != -1:
+                    x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]
+                x = m(x)
+                shape = str(list(x.shape)) if isinstance(x, torch.Tensor) else 'Multiple outputs'
+                print(f"{i:<6} {str(m.f):<6} {m.__class__.__name__:<40} {shape:<20}")
+                y.append(x if m.i in self.save else None)
+        
+        print("="*80)
+        print(f"Detected neck indices: {self.neck_indices}")
+        print("="*80 + "\n")
 
 
 Model = DetectionModel  # retain YOLO 'Model' class for backwards compatibility
